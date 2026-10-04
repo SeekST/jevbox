@@ -469,10 +469,15 @@ for (const protocolVersion of ["2026-07-28", "2025-11-25"])
       assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
         "answer",
         "cancel_run",
+        "create_folder",
+        "delete_resource",
         "fetch",
         "get_run",
         "list_organizations",
+        "list_resources",
         "list_runs",
+        "move_resource",
+        "rename_resource",
         "search",
         "upload_document",
       ]);
@@ -757,6 +762,7 @@ test("OAuth discovery, registration, PKCE, consent, audience validation, refresh
       "fetch",
       "get_run",
       "list_organizations",
+      "list_resources",
       "list_runs",
       "search",
     ],
@@ -962,13 +968,13 @@ test("OAuth discovery, registration, PKCE, consent, audience validation, refresh
   assert.equal(connected.status, 200, await connected.clone().text());
   assert.deepEqual(
     (await connected.json()).result.tools.map((tool: any) => tool.name).sort(),
-    ["fetch", "list_organizations"],
+    ["fetch", "list_organizations", "list_resources"],
   );
   assert.deepEqual(
     (await legacyTools(fresh.access_token)).tools
       .map((tool) => tool.name)
       .sort(),
-    ["fetch", "list_organizations"],
+    ["fetch", "list_organizations", "list_resources"],
   );
   await assert.rejects(legacyTools(refreshed.access_token));
   assert.equal(
@@ -1773,4 +1779,662 @@ test("upload revocation and storage failure roll back document, bytes, and queue
     )?.count,
     "0",
   );
+});
+
+test("resource changes roll back when revalidation fails and deletes require share on every descendant", async () => {
+  const { createResourceOperations } = await import("../server/resources");
+  const resources = createResourceOperations(runtime.store);
+  const a = { userId, orgId, role: "member", token: "test" };
+  const revoked = {
+    revalidate: async () => {
+      throw new Error("Revoked");
+    },
+  };
+  const folderId = randomUUID();
+  const foreignChild = randomUUID();
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,kind,name,created) VALUES(?,?,?,'folder',?,?)",
+    folderId,
+    orgId,
+    userId,
+    "Rollback folder",
+    new Date().toISOString(),
+  );
+  const named = async (name: string) =>
+    (
+      await runtime.store.one<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM resources WHERE name=?",
+        name,
+      )
+    )?.count;
+  await assert.rejects(
+    resources.createFolder(
+      a,
+      { name: "Revoked folder", description: "", parentId: null },
+      revoked,
+    ),
+    /Revoked/,
+  );
+  assert.equal(await named("Revoked folder"), "0");
+  await assert.rejects(
+    resources.rename(
+      a,
+      folderId,
+      { name: "Renamed", description: "" },
+      revoked,
+    ),
+    /Revoked/,
+  );
+  assert.equal(await named("Rollback folder"), "1");
+  await assert.rejects(resources.remove(a, [folderId], revoked), /Revoked/);
+  assert.equal(await named("Rollback folder"), "1");
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+    foreignChild,
+    orgId,
+    otherId,
+    folderId,
+    "Other member's document",
+    new Date().toISOString(),
+  );
+  await assert.rejects(resources.remove(a, [folderId]), /Resource not found/);
+  assert.equal(await named("Rollback folder"), "1");
+  assert.equal(await named("Other member's document"), "1");
+  await runtime.store.run("DELETE FROM resources WHERE id=?", foreignChild);
+  assert.equal(
+    await resources.remove(a, [folderId], { auditPrefix: "api." }),
+    1,
+  );
+  assert.equal(await named("Rollback folder"), "0");
+  assert.ok(
+    await runtime.store.one(
+      "SELECT 1 FROM audit WHERE resource_id=? AND action='api.resource.delete'",
+      folderId,
+    ),
+  );
+});
+
+test("new API keys include documents:manage while older keys keep their permissions", async () => {
+  const { createApiKeys } = await import("../server/api-keys");
+  const { createExternalAccess } = await import("../server/external-access");
+  const { createUploads } = await import("../server/uploads");
+  const keys = createApiKeys(runtime.auth);
+  const created = await key();
+  const older = await runtime.auth.api.createApiKey({
+    body: {
+      userId,
+      name: "Older",
+      permissions: { documents: ["read", "write"], search: ["read"] },
+      expiresIn: 86400,
+    },
+  });
+  try {
+    const current = await keys.authenticate(created.token);
+    assert.ok(current.scopes.includes("documents:manage"));
+    assert.deepEqual((await keys.authenticate(older.key)).scopes.sort(), [
+      "documents:read",
+      "documents:write",
+      "search:read",
+    ]);
+    const access = createExternalAccess(
+      runtime.store,
+      runtime.auth,
+      runtime.providers,
+      origin,
+      async () => {
+        throw new Error("Token validation is not used for keys");
+      },
+      false,
+      createUploads(runtime.store),
+    );
+    const delegated = await access.delegatedPrincipal(
+      JSON.stringify({ principal: current }),
+    );
+    assert.ok(delegated.scopes.includes("documents:manage"));
+    const metadata = await (
+      await fetch(base + "/.well-known/oauth-protected-resource/api/v1")
+    ).json();
+    assert.ok(metadata.scopes_supported.includes("documents:manage"));
+  } finally {
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    await session("/auth/api-key/update", "POST", {
+      keyId: older.id,
+      enabled: false,
+    });
+  }
+});
+
+test("REST and MCP management revalidate scopes before changing anything", async () => {
+  const { createExternalAccess } = await import("../server/external-access");
+  const { createUploads } = await import("../server/uploads");
+  const access = createExternalAccess(
+    runtime.store,
+    runtime.auth,
+    runtime.providers,
+    origin,
+    async () => {
+      throw new Error("unused");
+    },
+    false,
+    createUploads(runtime.store),
+  );
+  const documentId = randomUUID();
+  const folderId = randomUUID();
+  const createdAt = new Date().toISOString();
+  const principal = {
+    userId,
+    scopes: ["documents:read", "documents:manage"],
+    credentialId: "test",
+  };
+  const downgraded = async () => ({ ...principal, scopes: ["documents:read"] });
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,NULL,'document',?,'restricted',?)",
+    documentId,
+    orgId,
+    userId,
+    "Revalidate document",
+    createdAt,
+  );
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,NULL,'folder',?,'restricted',?)",
+    folderId,
+    orgId,
+    userId,
+    "Revalidate folder",
+    createdAt,
+  );
+  try {
+    await assert.rejects(
+      access.moveResource(
+        principal,
+        { organizationId: orgId, id: documentId, parentId: folderId },
+        downgraded,
+      ),
+    );
+    assert.equal(
+      (
+        await runtime.store.one<any>(
+          "SELECT parent_id FROM resources WHERE id=?",
+          documentId,
+        )
+      ).parent_id,
+      null,
+    );
+    await assert.rejects(
+      access.deleteResource(
+        principal,
+        { organizationId: orgId, id: folderId },
+        downgraded,
+      ),
+    );
+    assert.ok(
+      await runtime.store.one<any>(
+        "SELECT id FROM resources WHERE id=?",
+        folderId,
+      ),
+    );
+  } finally {
+    await runtime.store.run("DELETE FROM resources WHERE id=ANY(?::text[])", [
+      documentId,
+      folderId,
+    ]);
+  }
+});
+
+test("REST editors who do not own an item can rename it but not move or delete it", async () => {
+  const created = await key();
+  const documentId = randomUUID();
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,NULL,'document',?,'restricted',?)",
+    documentId,
+    orgId,
+    otherId,
+    "Owned by another",
+    new Date().toISOString(),
+  );
+  await runtime.store.run(
+    "INSERT INTO grants VALUES(?,?,'editor')",
+    documentId,
+    userId,
+  );
+  try {
+    const call = (path: string, method: string, body?: unknown) =>
+      request(
+        `/api/v1${path}?organizationId=${orgId}`,
+        created.token,
+        method,
+        body,
+      );
+    const renamed = await call(`/resources/${documentId}`, "PATCH", {
+      name: "Renamed by editor",
+    });
+    assert.equal(renamed.status, 200, await renamed.clone().text());
+    assert.equal(
+      (await call(`/resources/${documentId}/move`, "POST", { parentId: null }))
+        .status,
+      404,
+    );
+    assert.equal(
+      (await call(`/resources/${documentId}`, "DELETE")).status,
+      404,
+    );
+    assert.ok(
+      await runtime.store.one<any>(
+        "SELECT id FROM resources WHERE id=?",
+        documentId,
+      ),
+    );
+  } finally {
+    await runtime.store.run("DELETE FROM resources WHERE id=?", documentId);
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+  }
+});
+
+test("REST lists readable resources with folder and kind filters", async () => {
+  const created = await key();
+  const folderId = randomUUID();
+  const nestedId = randomUUID();
+  const createdAt = new Date().toISOString();
+  let searchOnly: { id: string; key: string } | undefined;
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,kind,name,created) VALUES(?,?,?,'folder',?,?)",
+    folderId,
+    orgId,
+    userId,
+    "Listing folder",
+    createdAt,
+  );
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+    nestedId,
+    orgId,
+    userId,
+    folderId,
+    "Nested",
+    createdAt,
+  );
+  try {
+    const list = (query = "", token = created.token) =>
+      request(`/api/v1/resources?organizationId=${orgId}${query}`, token);
+    const response = await list();
+    assert.equal(response.status, 200, await response.clone().text());
+    const all = (await response.json()).resources;
+    const ids = all.map((r: any) => r.id);
+    for (const visible of [ownId, sharedId, emptyFolderId, folderId, nestedId])
+      assert.ok(ids.includes(visible), visible);
+    assert.ok(!ids.includes(privateId));
+    assert.ok(!ids.includes(foreignId));
+    const shared = all.find((r: any) => r.id === sharedId);
+    assert.equal(shared.canWrite, false);
+    assert.equal(shared.canShare, false);
+    assert.equal("parsed" in shared, false);
+    const folder = all.find((r: any) => r.id === folderId);
+    assert.equal(folder.kind, "folder");
+    assert.equal(folder.mime, "");
+    assert.equal(folder.size, 0);
+    assert.equal(folder.pages, 0);
+    assert.equal(folder.url, `${origin}/library/folders/${folderId}`);
+    const folders = (await (await list("&kind=folder")).json()).resources;
+    assert.ok(folders.length > 0);
+    assert.ok(folders.every((r: any) => r.kind === "folder"));
+    const children = (await (await list(`&parentId=${folderId}`)).json())
+      .resources;
+    assert.deepEqual(
+      children.map((r: any) => r.id),
+      [nestedId],
+    );
+    assert.equal(children[0].parentId, folderId);
+    assert.equal(children[0].canWrite, true);
+    assert.equal(children[0].canShare, true);
+    assert.equal(children[0].url, `${origin}/library/documents/${nestedId}`);
+    assert.equal((await list(`&parentId=${ownId}`)).status, 404);
+    assert.equal((await list(`&parentId=${privateId}`)).status, 404);
+    assert.equal((await list(`&parentId=${foreignId}`)).status, 404);
+    assert.equal((await list("&kind=other")).status, 400);
+    assert.equal((await list("&parentId=")).status, 400);
+    assert.equal(
+      (
+        await request(
+          `/api/v1/resources?organizationId=${foreignOrgId}`,
+          created.token,
+        )
+      ).status,
+      404,
+    );
+    searchOnly = await runtime.auth.api.createApiKey({
+      body: {
+        userId,
+        name: "Search only",
+        permissions: { search: ["read"] },
+        expiresIn: 86400,
+      },
+    });
+    assert.equal((await list("", searchOnly!.key)).status, 403);
+  } finally {
+    await runtime.store.run("DELETE FROM resources WHERE id=ANY(?::text[])", [
+      nestedId,
+      folderId,
+    ]);
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    if (searchOnly)
+      await session("/auth/api-key/update", "POST", {
+        keyId: searchOnly.id,
+        enabled: false,
+      });
+  }
+});
+
+test("REST manages folders and documents with documents:manage and web permissions", async () => {
+  await runtime.store.run("DELETE FROM upload_usage");
+  const created = await key();
+  let older: { id: string; key: string } | undefined;
+  try {
+    const call = (
+      path: string,
+      method: string,
+      body?: unknown,
+      token = created.token,
+    ) =>
+      request(
+        `/api/v1${path}${path.includes("?") ? "&" : "?"}organizationId=${orgId}`,
+        token,
+        method,
+        body,
+      );
+    const row = (id: string) =>
+      runtime.store.one<any>("SELECT * FROM resources WHERE id=?", id);
+    const folder = await call("/folders", "POST", { name: "Managed" });
+    assert.equal(folder.status, 201, await folder.clone().text());
+    const { id: folderId, url } = await folder.json();
+    assert.equal(url, `${origin}/library/folders/${folderId}`);
+    assert.equal((await row(folderId)).owner_id, userId);
+    assert.equal((await row(folderId)).access, "restricted");
+    const child = await call("/folders", "POST", {
+      name: "Child",
+      parentId: folderId,
+    });
+    assert.equal(child.status, 201, await child.clone().text());
+    const { id: childId } = await child.json();
+    for (const name of ["a/b", "tab\there", "x".repeat(161), " "])
+      assert.equal(
+        (await call("/folders", "POST", { name })).status,
+        400,
+        name,
+      );
+    assert.equal(
+      (
+        await call("/folders", "POST", {
+          name: "Under a document",
+          parentId: ownId,
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await call("/folders", "POST", { name: "Hidden", parentId: privateId }))
+        .status,
+      404,
+    );
+    const renamed = await call(`/resources/${folderId}`, "PATCH", {
+      name: "Renamed",
+      description: "Notes",
+    });
+    assert.equal(renamed.status, 200, await renamed.clone().text());
+    assert.equal((await row(folderId)).name, "Renamed");
+    assert.equal((await row(folderId)).description, "Notes");
+    const nameOnly = await call(`/resources/${folderId}`, "PATCH", {
+      name: "Renamed again",
+    });
+    assert.equal(nameOnly.status, 200, await nameOnly.clone().text());
+    assert.equal((await row(folderId)).name, "Renamed again");
+    assert.equal((await row(folderId)).description, "Notes");
+    assert.equal(
+      (await call(`/resources/${sharedId}`, "PATCH", { name: "Nope" })).status,
+      404,
+    );
+    assert.equal(
+      (await call(`/resources/${folderId}/move`, "POST", { parentId: childId }))
+        .status,
+      400,
+    );
+    assert.equal(
+      (
+        await call(`/resources/${folderId}/move`, "POST", {
+          parentId: folderId,
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await call(`/resources/${childId}/move`, "POST", { parentId: ownId }))
+        .status,
+      400,
+    );
+    const inheritingId = randomUUID();
+    await runtime.store.run(
+      "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+      inheritingId,
+      orgId,
+      userId,
+      childId,
+      "Inheriting",
+      new Date().toISOString(),
+    );
+    const toRoot = await call(`/resources/${inheritingId}/move`, "POST", {
+      parentId: null,
+    });
+    assert.equal(toRoot.status, 200, await toRoot.clone().text());
+    assert.equal((await row(inheritingId)).parent_id, null);
+    assert.equal((await row(inheritingId)).access, "restricted");
+    assert.equal(
+      (
+        await call(`/resources/${inheritingId}/move`, "POST", {
+          parentId: childId,
+        })
+      ).status,
+      200,
+    );
+    assert.equal((await row(inheritingId)).parent_id, childId);
+    assert.equal(
+      (await call(`/resources/${sharedId}/move`, "POST", { parentId: null }))
+        .status,
+      404,
+    );
+    const othersDocument = randomUUID();
+    await runtime.store.run(
+      "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+      othersDocument,
+      orgId,
+      otherId,
+      folderId,
+      "Owned by another member",
+      new Date().toISOString(),
+    );
+    assert.equal((await call(`/resources/${folderId}`, "DELETE")).status, 404);
+    assert.ok(await row(folderId));
+    assert.ok(await row(childId));
+    await runtime.store.run("DELETE FROM resources WHERE id=?", othersDocument);
+    const removed = await call(`/resources/${folderId}`, "DELETE");
+    assert.equal(removed.status, 200, await removed.clone().text());
+    assert.deepEqual(await removed.json(), { ok: true, count: 3 });
+    for (const gone of [folderId, childId, inheritingId])
+      assert.equal(await row(gone), undefined);
+    assert.equal((await call(`/resources/${folderId}`, "DELETE")).status, 404);
+    assert.deepEqual(
+      (
+        await runtime.store.all<{ action: string }>(
+          "SELECT action FROM audit WHERE resource_id=? ORDER BY action",
+          folderId,
+        )
+      ).map(({ action }) => action),
+      [
+        "api.folder.create",
+        "api.resource.delete",
+        "api.resource.update",
+        "api.resource.update",
+      ],
+    );
+    const uploaded = await uploadRequest(
+      created.token,
+      new Blob(["Queued text"], { type: "application/octet-stream" }),
+    );
+    assert.equal(uploaded.status, 201, await uploaded.clone().text());
+    const { id: queuedId } = await uploaded.json();
+    assert.equal((await call(`/resources/${queuedId}`, "DELETE")).status, 200);
+    assert.equal(await row(queuedId), undefined);
+    assert.equal((await call(`/resources/${foreignId}`, "DELETE")).status, 404);
+    assert.equal(
+      (
+        await request(
+          `/api/v1/resources/${foreignId}?organizationId=${foreignOrgId}`,
+          created.token,
+          "DELETE",
+        )
+      ).status,
+      404,
+    );
+    older = await runtime.auth.api.createApiKey({
+      body: {
+        userId,
+        name: "Before manage",
+        permissions: { documents: ["read", "write"], search: ["read"] },
+        expiresIn: 86400,
+      },
+    });
+    for (const [path, method, body] of [
+      ["/folders", "POST", { name: "Denied" }],
+      [`/resources/${ownId}`, "PATCH", { name: "Denied" }],
+      [`/resources/${ownId}/move`, "POST", { parentId: null }],
+      [`/resources/${ownId}`, "DELETE", undefined],
+    ] as const)
+      assert.equal(
+        (await call(path, method, body, older.key)).status,
+        403,
+        `${method} ${path}`,
+      );
+    assert.ok(await row(ownId));
+  } finally {
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    if (older)
+      await session("/auth/api-key/update", "POST", {
+        keyId: older.id,
+        enabled: false,
+      });
+  }
+});
+
+test("MCP resource tools follow scopes and mark deletion destructive", async () => {
+  const created = await key();
+  let older:
+    Awaited<ReturnType<typeof runtime.auth.api.createApiKey>> | undefined;
+  try {
+    const rpc = async (
+      id: number,
+      method: string,
+      params?: object,
+      token = created.token,
+    ) =>
+      (
+        await request("/mcp", token, "POST", {
+          jsonrpc: "2.0",
+          id,
+          method,
+          ...(params ? { params } : {}),
+        })
+      ).json();
+    const tools = new Map<string, any>(
+      (await rpc(200, "tools/list")).result.tools.map((tool: any) => [
+        tool.name,
+        tool,
+      ]),
+    );
+    assert.equal(tools.get("list_resources").annotations.readOnlyHint, true);
+    assert.equal(tools.get("create_folder").annotations.readOnlyHint, false);
+    assert.equal(tools.get("rename_resource").annotations.idempotentHint, true);
+    assert.equal(tools.get("move_resource").annotations.idempotentHint, true);
+    assert.equal(tools.get("move_resource").annotations.destructiveHint, true);
+    assert.equal(
+      tools.get("delete_resource").annotations.destructiveHint,
+      true,
+    );
+    assert.equal(
+      tools.get("delete_resource").annotations.idempotentHint,
+      false,
+    );
+    const call = async (id: number, name: string, args: object) =>
+      (
+        await rpc(id, "tools/call", {
+          name,
+          arguments: { organizationId: orgId, ...args },
+        })
+      ).result;
+    const outer = await call(201, "create_folder", { name: "MCP outer" });
+    assert.equal(outer.isError, undefined, JSON.stringify(outer));
+    const inner = await call(202, "create_folder", { name: "MCP inner" });
+    const outerId = outer.structuredContent.id;
+    const innerId = inner.structuredContent.id;
+    const renamed = await call(203, "rename_resource", {
+      id: innerId,
+      name: "MCP renamed",
+    });
+    assert.equal(renamed.isError, undefined, JSON.stringify(renamed));
+    const moved = await call(204, "move_resource", {
+      id: innerId,
+      parentId: outerId,
+    });
+    assert.equal(moved.isError, undefined, JSON.stringify(moved));
+    const listed = await call(205, "list_resources", { parentId: outerId });
+    assert.deepEqual(
+      listed.structuredContent.resources.map((r: any) => [r.id, r.name]),
+      [[innerId, "MCP renamed"]],
+    );
+    const removed = await call(206, "delete_resource", { id: outerId });
+    assert.equal(removed.isError, undefined, JSON.stringify(removed));
+    assert.equal(removed.structuredContent.count, 2);
+    assert.equal(
+      (await call(207, "delete_resource", { id: outerId })).isError,
+      true,
+    );
+    older = await runtime.auth.api.createApiKey({
+      body: {
+        userId,
+        name: "MCP before manage",
+        permissions: { documents: ["read", "write"], search: ["read"] },
+        expiresIn: 86400,
+      },
+    });
+    const names = (
+      await rpc(208, "tools/list", undefined, older.key)
+    ).result.tools.map((tool: any) => tool.name);
+    assert.ok(names.includes("list_resources"));
+    for (const name of [
+      "create_folder",
+      "rename_resource",
+      "move_resource",
+      "delete_resource",
+    ])
+      assert.ok(!names.includes(name), name);
+  } finally {
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    if (older)
+      await session("/auth/api-key/update", "POST", {
+        keyId: older.id,
+        enabled: false,
+      });
+  }
 });

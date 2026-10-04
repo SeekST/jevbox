@@ -19,13 +19,21 @@ import {
   requireResource,
   requireResources,
   resourceAccessBatch,
+  resourcePermissionsBatch,
   visibleResources,
   type Actor,
+  type Resource,
   type Store,
   type PermissionCache,
 } from "./db";
 import { flatten, withLayoutSections, type ParsedDocument } from "./indexing";
 import type { createProviders } from "./providers";
+import {
+  createResourceOperations,
+  resourceDescription,
+  resourceName,
+  type ResourceChange,
+} from "./resources";
 import { uploadInput, decodeUpload, type createUploads } from "./uploads";
 import { searchRateLimits } from "./rate-limits";
 
@@ -45,6 +53,7 @@ const delegationSchema = z.object({
 });
 const documentPath = (id: string, nodeId?: string) =>
   `/library/documents/${encodeURIComponent(id)}${nodeId ? `?${new URLSearchParams({ node: nodeId, tab: "index" })}` : ""}`;
+const folderPath = (id: string) => `/library/folders/${encodeURIComponent(id)}`;
 const organizationId = z.string().uuid();
 export const searchInput = z
   .object({
@@ -54,6 +63,39 @@ export const searchInput = z
     folderId: z.string().uuid().optional(),
     limit: z.number().int().min(1).max(12).default(12),
   })
+  .strict();
+export const listResourcesInput = z
+  .object({
+    organizationId,
+    parentId: z.string().uuid().optional(),
+    kind: z.enum(["document", "folder"]).optional(),
+  })
+  .strict();
+export const createFolderInput = z
+  .object({
+    organizationId,
+    name: resourceName,
+    description: resourceDescription,
+    parentId: z.string().uuid().nullable().default(null),
+  })
+  .strict();
+export const renameResourceInput = z
+  .object({
+    organizationId,
+    id: z.string().uuid(),
+    name: resourceName,
+    description: z.string().max(1000).optional(),
+  })
+  .strict();
+export const moveResourceInput = z
+  .object({
+    organizationId,
+    id: z.string().uuid(),
+    parentId: z.string().uuid().nullable(),
+  })
+  .strict();
+export const deleteResourceInput = z
+  .object({ organizationId, id: z.string().uuid() })
   .strict();
 export const fetchInput = z
   .object({
@@ -77,6 +119,7 @@ export function createExternalAccess(
   uploads: ReturnType<typeof createUploads>,
 ) {
   const keys = createApiKeys(auth);
+  const resources = createResourceOperations(store);
   const verifiedRequests = new WeakSet<Request>();
   const keyRequests = new WeakMap<Request, Principal>();
   const searchLimits = new MemoryStore();
@@ -248,7 +291,7 @@ export function createExternalAccess(
           ? JSON.parse(key.permissions)
           : key.permissions;
       scopes = ["documents", "search"].flatMap((resource) =>
-        ["read", "write"]
+        ["read", "write", "manage"]
           .filter((operation) => permissions?.[resource]?.includes(operation))
           .map((operation) => `${resource}:${operation}`),
       );
@@ -385,7 +428,14 @@ export function createExternalAccess(
     const retrieved =
       input.folderId && !documentIds.length
         ? { results: [] }
-        : await providers.retrieve(a, input.query, documentIds, signal, undefined, permissionCache);
+        : await providers.retrieve(
+            a,
+            input.query,
+            documentIds,
+            signal,
+            undefined,
+            permissionCache,
+          );
     await audit(principal, a.orgId, "api.search");
     const current = await revalidate();
     requireScope(current, "search:read");
@@ -461,6 +511,116 @@ export function createExternalAccess(
       nextOffset,
       tree: parsed.nodes.map(outline),
     };
+  }
+  function resourceView(r: Resource, canWrite: boolean, canShare: boolean) {
+    const folder = r.kind === "folder";
+    return {
+      id: r.id,
+      kind: r.kind,
+      name: r.name,
+      description: r.description,
+      parentId: r.parent_id,
+      access: r.access,
+      mime: folder ? "" : (r.mime ?? ""),
+      size: folder ? 0 : Number(r.size),
+      status: r.status,
+      error: r.error,
+      pages: !folder && r.parsed ? JSON.parse(r.parsed).pages : 0,
+      created: r.created,
+      canWrite,
+      canShare,
+      url: `${origin}${folder ? folderPath(r.id) : documentPath(r.id)}`,
+    };
+  }
+  async function listResources(principal: Principal, body: unknown) {
+    requireScope(principal, "documents:read");
+    const input = listResourcesInput.parse(body);
+    const a = await actor(principal, input.organizationId);
+    const rows = await resources.list(a, input);
+    const allowed = await resourcePermissionsBatch(
+      store,
+      a,
+      rows.flatMap(({ id }) => [
+        { id, action: "write" as const },
+        { id, action: "share" as const },
+      ]),
+    );
+    return {
+      resources: rows.map((r, index) =>
+        resourceView(r, allowed[index * 2], allowed[index * 2 + 1]),
+      ),
+    };
+  }
+  async function manage<T>(
+    principal: Principal,
+    orgId: string,
+    revalidate: () => Promise<Principal>,
+    work: (a: Actor, options: ResourceChange) => Promise<T>,
+  ) {
+    const a = await actor(principal, orgId);
+    return work(a, {
+      auditPrefix: "api.",
+      revalidate: async () => {
+        const current = await revalidate();
+        requireScope(current, "documents:manage");
+        await actor(current, orgId);
+      },
+    });
+  }
+  async function createFolder(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const { organizationId: orgId, ...input } = createFolderInput.parse(body);
+    const { id } = await manage(principal, orgId, revalidate, (a, options) =>
+      resources.createFolder(a, input, options),
+    );
+    return { id, url: `${origin}${folderPath(id)}` };
+  }
+  async function renameResource(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const {
+      organizationId: orgId,
+      id,
+      ...input
+    } = renameResourceInput.parse(body);
+    await manage(principal, orgId, revalidate, (a, options) =>
+      resources.rename(a, id, input, options),
+    );
+    return { ok: true };
+  }
+  async function moveResource(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const input = moveResourceInput.parse(body);
+    await manage(principal, input.organizationId, revalidate, (a, options) =>
+      resources.move(a, input.id, input.parentId, options),
+    );
+    return { ok: true };
+  }
+  async function deleteResource(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const input = deleteResourceInput.parse(body);
+    const count = await manage(
+      principal,
+      input.organizationId,
+      revalidate,
+      (a, options) => resources.remove(a, [input.id], options),
+    );
+    return { ok: true, count };
   }
   function outline(node: ParsedDocument["nodes"][number]): unknown {
     return {
@@ -579,6 +739,53 @@ export function createExternalAccess(
       ),
     ),
   );
+  router.get("/resources", async (req, res) =>
+    res.json(
+      await listResources(await authenticate(req, "/api/v1"), {
+        organizationId: req.query.organizationId,
+        ...(req.query.parentId !== undefined
+          ? { parentId: req.query.parentId }
+          : {}),
+        ...(req.query.kind !== undefined ? { kind: req.query.kind } : {}),
+      }),
+    ),
+  );
+  const managed =
+    (
+      handler: (
+        principal: Principal,
+        body: unknown,
+        revalidate: () => Promise<Principal>,
+      ) => Promise<object>,
+      body: (req: Request) => object,
+      status = 200,
+    ) =>
+    async (req: Request, res: import("express").Response) =>
+      res
+        .status(status)
+        .json(
+          await handler(
+            await authenticate(req, "/api/v1"),
+            { ...body(req), organizationId: req.query.organizationId },
+            () => authenticate(req, "/api/v1"),
+          ),
+        );
+  router.post(
+    "/folders",
+    managed(createFolder, (req) => ({ ...req.body }), 201),
+  );
+  router.patch(
+    "/resources/:id",
+    managed(renameResource, (req) => ({ ...req.body, id: req.params.id })),
+  );
+  router.post(
+    "/resources/:id/move",
+    managed(moveResource, (req) => ({ ...req.body, id: req.params.id })),
+  );
+  router.delete(
+    "/resources/:id",
+    managed(deleteResource, (req) => ({ id: req.params.id })),
+  );
   router.use((_req, res) => res.status(404).json({ error: "Not found" }));
   router.use(
     (
@@ -606,6 +813,11 @@ export function createExternalAccess(
     delegatedPrincipal,
     delegatedActor,
     organizations,
+    listResources,
+    createFolder,
+    renameResource,
+    moveResource,
+    deleteResource,
     search,
     read,
     upload,

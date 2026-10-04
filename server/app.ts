@@ -9,6 +9,11 @@ import { createRuns } from "./runs";
 import { createGitHubStars } from "./github-stars";
 import { apiScopes } from "../shared/api-access";
 import { createUploads } from "./uploads";
+import {
+  createResourceOperations,
+  resourceDescription,
+  resourceName,
+} from "./resources";
 import { uploadLimits } from "../shared/uploads";
 import { isAuthPage, loginRedirect } from "../shared/auth-navigation";
 import { oauthProviderAuthServerMetadata } from "@better-auth/oauth-provider";
@@ -35,7 +40,7 @@ import {
   createApiRateLimiter,
   createAnonymousRateLimiter,
 } from "./rate-limits";
-import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { z } from "zod";
 import {
   createStore,
@@ -51,15 +56,6 @@ import {
 import { createProviders, getSettings, type Fetch } from "./providers";
 const digest = (s: string) => createHash("sha256").update(s).digest("hex");
 const now = () => new Date().toISOString();
-const name = z
-  .string()
-  .trim()
-  .min(1)
-  .max(160)
-  .refine(
-    (s) => !/[\x00-\x1f/\\]/.test(s),
-    "Use a name without slashes or control characters",
-  );
 const id = z.string().uuid();
 type AuthedRequest = Request & {
   actor: Actor;
@@ -86,6 +82,7 @@ export async function createApp(options: {
   const { auth } = authentication;
   const providers = createProviders(store, options.fetcher);
   const uploads = createUploads(store, { rateLimits: options.rateLimits });
+  const resourceOperations = createResourceOperations(store);
   const external = createExternalAccess(
     store,
     auth,
@@ -756,36 +753,17 @@ export async function createApp(options: {
   });
   app.post(
     "/api/folders",
-    mutation(async (req, res) => {
-      const a = actor(req);
+    mutation(async (req) => {
       const input = z
         .object({
-          name,
-          description: z.string().max(1000).default(""),
+          name: resourceName,
+          description: resourceDescription,
           parentId: id.nullable().default(null),
         })
         .parse(req.body);
-      if (
-        input.parentId &&
-        (await requireResource(store, a, input.parentId, "write")).kind !==
-          "folder"
-      )
-        throw new HttpError(400, "Invalid parent");
-      const rid = randomUUID();
-      await store.run(
-        "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,description,created) VALUES(?,?,?,?,'folder',?,?,?)",
-        rid,
-        a.orgId,
-        a.userId,
-        input.parentId,
-        input.name,
-        input.description,
-        now(),
-      );
-      await audit(a, "folder.create", rid);
       return {
         status: 201,
-        body: { id: rid },
+        body: await resourceOperations.createFolder(actor(req), input),
       };
     }),
   );
@@ -958,24 +936,15 @@ export async function createApp(options: {
   );
   app.patch(
     "/api/resources/:id",
-    mutation(async (req, res) => {
-      const a = actor(req);
-      const r = await requireResource(
-        store,
-        a,
-        id.parse(req.params.id),
-        "write",
-      );
+    mutation(async (req) => {
       const input = z
-        .object({ name, description: z.string().max(1000).default("") })
+        .object({ name: resourceName, description: resourceDescription })
         .parse(req.body);
-      await store.run(
-        "UPDATE resources SET name=?,description=? WHERE id=?",
-        input.name,
-        input.description,
-        r.id,
+      await resourceOperations.rename(
+        actor(req),
+        id.parse(req.params.id),
+        input,
       );
-      await audit(a, "resource.update", r.id);
       return {
         status: 200,
         body: { ok: true },
@@ -985,99 +954,35 @@ export async function createApp(options: {
   app.post(
     "/api/resources/:id/move",
     mutation(async (req) => {
-      const a = actor(req);
-      const resource = await requireResource(
-        store,
-        a,
-        id.parse(req.params.id),
-        "share",
-      );
       const { parentId } = z
         .object({ parentId: id.nullable() })
         .strict()
         .parse(req.body);
-      await store.run(
-        "UPDATE document_filing SET state='completed',outcome=?,attempt_id=NULL,error=NULL WHERE resource_id=?",
-        JSON.stringify({ reason: "manual", parentId }),
-        resource.id,
-      );
-      if (parentId === resource.parent_id)
-        return { status: 200, body: { ok: true } };
-      if (parentId) {
-        const destination = await requireResource(store, a, parentId, "write");
-        if (destination.kind !== "folder")
-          throw new HttpError(400, "Choose a folder as the destination");
-        let ancestor: string | null = parentId;
-        const seen = new Set<string>();
-        while (ancestor) {
-          if (ancestor === resource.id || seen.has(ancestor))
-            throw new HttpError(
-              400,
-              "A folder cannot be moved into itself or its descendants",
-            );
-          seen.add(ancestor);
-          const parent: { parent_id: string | null } | undefined =
-            await store.one(
-              "SELECT parent_id FROM resources WHERE id=? AND org_id=?",
-              ancestor,
-              a.orgId,
-            );
-          ancestor = parent?.parent_id ?? null;
-        }
-      }
-      await store.run(
-        "UPDATE resources SET parent_id=?,access=CASE WHEN ?::text IS NULL AND access='inherit' THEN 'restricted' ELSE access END WHERE id=?",
+      await resourceOperations.move(
+        actor(req),
+        id.parse(req.params.id),
         parentId,
-        parentId,
-        resource.id,
       );
-      await audit(a, "resource.move", resource.id);
       return { status: 200, body: { ok: true } };
     }),
   );
-  async function deleteResources(a: Actor, selectedIds: string[]) {
-    for (const resourceId of selectedIds)
-      await requireResource(store, a, resourceId, "share");
-    const descendants = await store.all<{ id: string }>(
-      `WITH RECURSIVE subtree AS (
-        SELECT id FROM resources WHERE org_id=? AND id=ANY(?::text[])
-        UNION
-        SELECT r.id FROM resources r JOIN subtree s ON r.parent_id=s.id WHERE r.org_id=?
-      ) SELECT id FROM subtree`,
-      a.orgId,
-      selectedIds,
-      a.orgId,
-    );
-    const resourceIds = descendants.map((resource) => resource.id);
-    for (const resourceId of resourceIds)
-      if (!selectedIds.includes(resourceId))
-        await requireResource(store, a, resourceId, "share");
-    await store.run(
-      "DELETE FROM resources WHERE org_id=? AND id=ANY(?::text[])",
-      a.orgId,
-      resourceIds,
-    );
-    for (const resourceId of resourceIds)
-      await audit(a, "resource.delete", resourceId);
-    return resourceIds.length;
-  }
   app.post(
     "/api/resources/delete-batch",
     mutation(async (req) => {
-      const a = actor(req);
       const { ids } = z
         .object({ ids: z.array(id).min(1).max(100) })
         .strict()
         .parse(req.body);
-      const count = await deleteResources(a, [...new Set(ids)]);
+      const count = await resourceOperations.remove(actor(req), [
+        ...new Set(ids),
+      ]);
       return { status: 200, body: { ok: true, count } };
     }),
   );
   app.delete(
     "/api/resources/:id",
-    mutation(async (req, res) => {
-      const a = actor(req);
-      await deleteResources(a, [id.parse(req.params.id)]);
+    mutation(async (req) => {
+      await resourceOperations.remove(actor(req), [id.parse(req.params.id)]);
       return {
         status: 200,
         body: { ok: true },

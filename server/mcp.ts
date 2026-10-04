@@ -13,7 +13,15 @@ import {
   listRunsInput,
   type createRuns,
 } from "./runs";
-import { fetchInput, type createExternalAccess } from "./external-access";
+import {
+  createFolderInput,
+  deleteResourceInput,
+  fetchInput,
+  listResourcesInput,
+  moveResourceInput,
+  renameResourceInput,
+  type createExternalAccess,
+} from "./external-access";
 
 export function createMcpRouter(
   access: ReturnType<typeof createExternalAccess>,
@@ -185,6 +193,64 @@ export function createMcpRouter(
                   (input) =>
                     respond(() => access.read(principal, input, revalidate)),
                 );
+              if (principal.scopes.includes("documents:read"))
+                server.registerTool(
+                  "list_resources",
+                  {
+                    description:
+                      "List folders and documents you can read in an organization, newest first. Optional parentId lists only that folder's direct children; optional kind is document or folder. Use fetch to read a document's text.",
+                    inputSchema: listResourcesInput,
+                    annotations,
+                  },
+                  (input) =>
+                    respond(() => access.listResources(principal, input)),
+                );
+              if (principal.scopes.includes("documents:manage"))
+                for (const [name, description, schema, handler, hints] of [
+                  [
+                    "create_folder",
+                    "Create a Private folder you own. Optional parentId must be a folder you can write to.",
+                    createFolderInput,
+                    access.createFolder,
+                    { idempotentHint: false },
+                  ],
+                  [
+                    "rename_resource",
+                    "Rename a document or folder. Optional description replaces the current one; omit it to keep it. Requires write access.",
+                    renameResourceInput,
+                    access.renameResource,
+                    { idempotentHint: true },
+                  ],
+                  [
+                    "move_resource",
+                    "Move a document or folder into another folder, or to the library root with parentId null. Requires ownership of the item and write access to the destination.",
+                    moveResourceInput,
+                    access.moveResource,
+                    { idempotentHint: true, destructiveHint: true },
+                  ],
+                  [
+                    "delete_resource",
+                    "Permanently delete a document or folder you own. Folders are deleted with everything inside them, and deletion cannot be undone. Confirm with the user before calling.",
+                    deleteResourceInput,
+                    access.deleteResource,
+                    { idempotentHint: false, destructiveHint: true },
+                  ],
+                ] as const)
+                  server.registerTool(
+                    name,
+                    {
+                      description,
+                      inputSchema: schema,
+                      annotations: {
+                        readOnlyHint: false,
+                        destructiveHint: false,
+                        openWorldHint: false,
+                        ...hints,
+                      },
+                    },
+                    (input: unknown) =>
+                      respond(() => handler(principal, input, revalidate)),
+                  );
               if (principal.scopes.includes("documents:write"))
                 server.registerTool(
                   "upload_document",

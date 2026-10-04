@@ -427,7 +427,7 @@ export function McpConnectionGuide({
     <div className="mcp-guides">
       <div className="mcp-guides-heading">
         <h3>Connect your AI tools</h3>
-        <span>Read-only access</span>
+        <span>Uses your permissions</span>
       </div>
       <Tabs defaultValue="codex" className="mcp-guide-tabs">
         <ScrollArea orientation="horizontal" className="mcp-guide-tab-scroll">

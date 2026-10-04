@@ -469,10 +469,15 @@ for (const protocolVersion of ["2026-07-28", "2025-11-25"])
       assert.deepEqual(tools.tools.map((tool) => tool.name).sort(), [
         "answer",
         "cancel_run",
+        "create_folder",
+        "delete_resource",
         "fetch",
         "get_run",
         "list_organizations",
+        "list_resources",
         "list_runs",
+        "move_resource",
+        "rename_resource",
         "search",
         "upload_document",
       ]);
@@ -757,6 +762,7 @@ test("OAuth discovery, registration, PKCE, consent, audience validation, refresh
       "fetch",
       "get_run",
       "list_organizations",
+      "list_resources",
       "list_runs",
       "search",
     ],
@@ -962,13 +968,13 @@ test("OAuth discovery, registration, PKCE, consent, audience validation, refresh
   assert.equal(connected.status, 200, await connected.clone().text());
   assert.deepEqual(
     (await connected.json()).result.tools.map((tool: any) => tool.name).sort(),
-    ["fetch", "list_organizations"],
+    ["fetch", "list_organizations", "list_resources"],
   );
   assert.deepEqual(
     (await legacyTools(fresh.access_token)).tools
       .map((tool) => tool.name)
       .sort(),
-    ["fetch", "list_organizations"],
+    ["fetch", "list_organizations", "list_resources"],
   );
   await assert.rejects(legacyTools(refreshed.access_token));
   assert.equal(
@@ -2186,6 +2192,109 @@ test("REST manages folders and documents with documents:manage and web permissio
         `${method} ${path}`,
       );
     assert.ok(await row(ownId));
+  } finally {
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    if (older)
+      await session("/auth/api-key/update", "POST", {
+        keyId: older.id,
+        enabled: false,
+      });
+  }
+});
+
+test("MCP resource tools follow scopes and mark deletion destructive", async () => {
+  const created = await key();
+  let older:
+    Awaited<ReturnType<typeof runtime.auth.api.createApiKey>> | undefined;
+  try {
+    const rpc = async (
+      id: number,
+      method: string,
+      params?: object,
+      token = created.token,
+    ) =>
+      (
+        await request("/mcp", token, "POST", {
+          jsonrpc: "2.0",
+          id,
+          method,
+          ...(params ? { params } : {}),
+        })
+      ).json();
+    const tools = new Map<string, any>(
+      (await rpc(200, "tools/list")).result.tools.map((tool: any) => [
+        tool.name,
+        tool,
+      ]),
+    );
+    assert.equal(tools.get("list_resources").annotations.readOnlyHint, true);
+    assert.equal(tools.get("create_folder").annotations.readOnlyHint, false);
+    assert.equal(tools.get("rename_resource").annotations.idempotentHint, true);
+    assert.equal(tools.get("move_resource").annotations.idempotentHint, true);
+    assert.equal(
+      tools.get("delete_resource").annotations.destructiveHint,
+      true,
+    );
+    assert.equal(
+      tools.get("delete_resource").annotations.idempotentHint,
+      false,
+    );
+    const call = async (id: number, name: string, args: object) =>
+      (
+        await rpc(id, "tools/call", {
+          name,
+          arguments: { organizationId: orgId, ...args },
+        })
+      ).result;
+    const outer = await call(201, "create_folder", { name: "MCP outer" });
+    assert.equal(outer.isError, undefined, JSON.stringify(outer));
+    const inner = await call(202, "create_folder", { name: "MCP inner" });
+    const outerId = outer.structuredContent.id;
+    const innerId = inner.structuredContent.id;
+    const renamed = await call(203, "rename_resource", {
+      id: innerId,
+      name: "MCP renamed",
+    });
+    assert.equal(renamed.isError, undefined, JSON.stringify(renamed));
+    const moved = await call(204, "move_resource", {
+      id: innerId,
+      parentId: outerId,
+    });
+    assert.equal(moved.isError, undefined, JSON.stringify(moved));
+    const listed = await call(205, "list_resources", { parentId: outerId });
+    assert.deepEqual(
+      listed.structuredContent.resources.map((r: any) => [r.id, r.name]),
+      [[innerId, "MCP renamed"]],
+    );
+    const removed = await call(206, "delete_resource", { id: outerId });
+    assert.equal(removed.isError, undefined, JSON.stringify(removed));
+    assert.equal(removed.structuredContent.count, 2);
+    assert.equal(
+      (await call(207, "delete_resource", { id: outerId })).isError,
+      true,
+    );
+    older = await runtime.auth.api.createApiKey({
+      body: {
+        userId,
+        name: "MCP before manage",
+        permissions: { documents: ["read", "write"], search: ["read"] },
+        expiresIn: 86400,
+      },
+    });
+    const names = (
+      await rpc(208, "tools/list", undefined, older.key)
+    ).result.tools.map((tool: any) => tool.name);
+    assert.ok(names.includes("list_resources"));
+    for (const name of [
+      "create_folder",
+      "rename_resource",
+      "move_resource",
+      "delete_resource",
+    ])
+      assert.ok(!names.includes(name), name);
   } finally {
     await session("/auth/api-key/update", "POST", {
       keyId: created.key.id,

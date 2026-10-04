@@ -226,7 +226,7 @@ export function createMcpRouter(
                     "Move a document or folder into another folder, or to the library root with parentId null. Requires ownership of the item and write access to the destination.",
                     moveResourceInput,
                     access.moveResource,
-                    { idempotentHint: true },
+                    { idempotentHint: true, destructiveHint: true },
                   ],
                   [
                     "delete_resource",

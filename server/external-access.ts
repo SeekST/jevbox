@@ -743,8 +743,10 @@ export function createExternalAccess(
     res.json(
       await listResources(await authenticate(req, "/api/v1"), {
         organizationId: req.query.organizationId,
-        ...(req.query.parentId ? { parentId: req.query.parentId } : {}),
-        ...(req.query.kind ? { kind: req.query.kind } : {}),
+        ...(req.query.parentId !== undefined
+          ? { parentId: req.query.parentId }
+          : {}),
+        ...(req.query.kind !== undefined ? { kind: req.query.kind } : {}),
       }),
     ),
   );

@@ -1,7 +1,7 @@
 # API resource management
 
 Date: 2026-10-04
-Status: Draft for review
+Status: Approved
 
 ## Goal
 

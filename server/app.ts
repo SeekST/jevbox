@@ -40,7 +40,7 @@ import {
   createApiRateLimiter,
   createAnonymousRateLimiter,
 } from "./rate-limits";
-import { randomBytes, randomUUID, createHash } from "node:crypto";
+import { randomBytes, createHash } from "node:crypto";
 import { z } from "zod";
 import {
   createStore,
@@ -82,7 +82,7 @@ export async function createApp(options: {
   const { auth } = authentication;
   const providers = createProviders(store, options.fetcher);
   const uploads = createUploads(store, { rateLimits: options.rateLimits });
-  const resources = createResourceOperations(store);
+  const resourceOperations = createResourceOperations(store);
   const external = createExternalAccess(
     store,
     auth,
@@ -763,7 +763,7 @@ export async function createApp(options: {
         .parse(req.body);
       return {
         status: 201,
-        body: await resources.createFolder(actor(req), input),
+        body: await resourceOperations.createFolder(actor(req), input),
       };
     }),
   );
@@ -940,7 +940,11 @@ export async function createApp(options: {
       const input = z
         .object({ name: resourceName, description: resourceDescription })
         .parse(req.body);
-      await resources.rename(actor(req), id.parse(req.params.id), input);
+      await resourceOperations.rename(
+        actor(req),
+        id.parse(req.params.id),
+        input,
+      );
       return {
         status: 200,
         body: { ok: true },
@@ -954,7 +958,11 @@ export async function createApp(options: {
         .object({ parentId: id.nullable() })
         .strict()
         .parse(req.body);
-      await resources.move(actor(req), id.parse(req.params.id), parentId);
+      await resourceOperations.move(
+        actor(req),
+        id.parse(req.params.id),
+        parentId,
+      );
       return { status: 200, body: { ok: true } };
     }),
   );
@@ -965,14 +973,16 @@ export async function createApp(options: {
         .object({ ids: z.array(id).min(1).max(100) })
         .strict()
         .parse(req.body);
-      const count = await resources.remove(actor(req), [...new Set(ids)]);
+      const count = await resourceOperations.remove(actor(req), [
+        ...new Set(ids),
+      ]);
       return { status: 200, body: { ok: true, count } };
     }),
   );
   app.delete(
     "/api/resources/:id",
     mutation(async (req) => {
-      await resources.remove(actor(req), [id.parse(req.params.id)]);
+      await resourceOperations.remove(actor(req), [id.parse(req.params.id)]);
       return {
         status: 200,
         body: { ok: true },

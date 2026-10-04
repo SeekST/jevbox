@@ -1907,6 +1907,135 @@ test("new API keys include documents:manage while older keys keep their permissi
   }
 });
 
+test("REST and MCP management revalidate scopes before changing anything", async () => {
+  const { createExternalAccess } = await import("../server/external-access");
+  const { createUploads } = await import("../server/uploads");
+  const access = createExternalAccess(
+    runtime.store,
+    runtime.auth,
+    runtime.providers,
+    origin,
+    async () => {
+      throw new Error("unused");
+    },
+    false,
+    createUploads(runtime.store),
+  );
+  const documentId = randomUUID();
+  const folderId = randomUUID();
+  const createdAt = new Date().toISOString();
+  const principal = {
+    userId,
+    scopes: ["documents:read", "documents:manage"],
+    credentialId: "test",
+  };
+  const downgraded = async () => ({ ...principal, scopes: ["documents:read"] });
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,NULL,'document',?,'restricted',?)",
+    documentId,
+    orgId,
+    userId,
+    "Revalidate document",
+    createdAt,
+  );
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,NULL,'folder',?,'restricted',?)",
+    folderId,
+    orgId,
+    userId,
+    "Revalidate folder",
+    createdAt,
+  );
+  try {
+    await assert.rejects(
+      access.moveResource(
+        principal,
+        { organizationId: orgId, id: documentId, parentId: folderId },
+        downgraded,
+      ),
+    );
+    assert.equal(
+      (
+        await runtime.store.one<any>(
+          "SELECT parent_id FROM resources WHERE id=?",
+          documentId,
+        )
+      ).parent_id,
+      null,
+    );
+    await assert.rejects(
+      access.deleteResource(
+        principal,
+        { organizationId: orgId, id: folderId },
+        downgraded,
+      ),
+    );
+    assert.ok(
+      await runtime.store.one<any>(
+        "SELECT id FROM resources WHERE id=?",
+        folderId,
+      ),
+    );
+  } finally {
+    await runtime.store.run("DELETE FROM resources WHERE id=ANY(?::text[])", [
+      documentId,
+      folderId,
+    ]);
+  }
+});
+
+test("REST editors who do not own an item can rename it but not move or delete it", async () => {
+  const created = await key();
+  const documentId = randomUUID();
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,NULL,'document',?,'restricted',?)",
+    documentId,
+    orgId,
+    otherId,
+    "Owned by another",
+    new Date().toISOString(),
+  );
+  await runtime.store.run(
+    "INSERT INTO grants VALUES(?,?,'editor')",
+    documentId,
+    userId,
+  );
+  try {
+    const call = (path: string, method: string, body?: unknown) =>
+      request(
+        `/api/v1${path}?organizationId=${orgId}`,
+        created.token,
+        method,
+        body,
+      );
+    const renamed = await call(`/resources/${documentId}`, "PATCH", {
+      name: "Renamed by editor",
+    });
+    assert.equal(renamed.status, 200, await renamed.clone().text());
+    assert.equal(
+      (await call(`/resources/${documentId}/move`, "POST", { parentId: null }))
+        .status,
+      404,
+    );
+    assert.equal(
+      (await call(`/resources/${documentId}`, "DELETE")).status,
+      404,
+    );
+    assert.ok(
+      await runtime.store.one<any>(
+        "SELECT id FROM resources WHERE id=?",
+        documentId,
+      ),
+    );
+  } finally {
+    await runtime.store.run("DELETE FROM resources WHERE id=?", documentId);
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+  }
+});
+
 test("REST lists readable resources with folder and kind filters", async () => {
   const created = await key();
   const folderId = randomUUID();
@@ -1968,6 +2097,7 @@ test("REST lists readable resources with folder and kind filters", async () => {
     assert.equal((await list(`&parentId=${privateId}`)).status, 404);
     assert.equal((await list(`&parentId=${foreignId}`)).status, 404);
     assert.equal((await list("&kind=other")).status, 400);
+    assert.equal((await list("&parentId=")).status, 400);
     assert.equal(
       (
         await request(
@@ -2234,6 +2364,7 @@ test("MCP resource tools follow scopes and mark deletion destructive", async () 
     assert.equal(tools.get("create_folder").annotations.readOnlyHint, false);
     assert.equal(tools.get("rename_resource").annotations.idempotentHint, true);
     assert.equal(tools.get("move_resource").annotations.idempotentHint, true);
+    assert.equal(tools.get("move_resource").annotations.destructiveHint, true);
     assert.equal(
       tools.get("delete_resource").annotations.destructiveHint,
       true,

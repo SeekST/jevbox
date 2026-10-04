@@ -27,8 +27,9 @@ export function ApiUsageGuide({
     >
       <h2>API documentation</h2>
       <p className="muted">
-        Read your organizations, search documents, fetch source text, and upload
-        Private documents with your current permissions.
+        Read your organizations, search documents, fetch source text, upload
+        Private documents, and organize your library with your current
+        permissions.
       </p>
       <div className="api-endpoint">
         <span>
@@ -212,17 +213,63 @@ export function ApiUsageGuide({
           Repeating an upload creates another document.
         </p>
         <p>
-          New API keys include upload access. Older keys remain read-only;
-          create a new key for uploads. OAuth requires{" "}
-          <code>documents:write</code>. Uploaded documents belong to you and
-          start Private, including in shared folders. Upload cannot edit
-          existing documents or share them.
+          New API keys include upload and library management access. Older keys
+          keep the permissions they were created with; create a new key for
+          newer access. OAuth requires <code>documents:write</code>. Uploaded
+          documents belong to you and start Private, including in shared
+          folders. Upload cannot edit existing documents or share them.
         </p>
         <p className="muted">
           Accepts any file up to 250 MB. Text and code index locally when they
           contain UTF-8; other content is sent to Extend for parsing. Parsing
           failures appear in the document’s processing status.
         </p>
+      </article>
+      <article className="api-docs-section">
+        <h3>5. Manage your library</h3>
+        <div className="api-docs-route">
+          <Badge variant="success">GET</Badge>
+          <code>/resources</code>
+        </div>
+        <p>
+          Lists folders and documents you can read, newest first. Add{" "}
+          <code>parentId</code> for one folder’s direct children or{" "}
+          <code>kind</code> for only documents or folders.
+        </p>
+        <RequestCode
+          label="List resources · cURL"
+          text={`curl --fail-with-body --get "${url}/resources" \\\n  ${authorization} \\\n  --data-urlencode "organizationId=<ORGANIZATION_ID>"`}
+          onCopy={onCopy}
+        />
+        <div className="api-docs-route">
+          <Badge variant="warning">POST</Badge>
+          <code>/folders</code>
+        </div>
+        <div className="api-docs-route">
+          <Badge variant="info">PATCH</Badge>
+          <code>/resources/:id</code>
+        </div>
+        <div className="api-docs-route">
+          <Badge variant="warning">POST</Badge>
+          <code>/resources/:id/move</code>
+        </div>
+        <div className="api-docs-route">
+          <Badge variant="error">DELETE</Badge>
+          <code>/resources/:id</code>
+        </div>
+        <p>
+          Create folders, rename, move, and delete with{" "}
+          <code>organizationId</code> in the query string. Moving and deleting
+          require that you own the item; deleting a folder also deletes
+          everything inside it and cannot be undone. OAuth requires{" "}
+          <code>documents:manage</code>. Sharing settings cannot be changed
+          through the API.
+        </p>
+        <RequestCode
+          label="Delete a document · cURL"
+          text={`curl --fail-with-body -X DELETE "${url}/resources/<RESOURCE_ID>?organizationId=<ORGANIZATION_ID>" \\\n  ${authorization}`}
+          onCopy={onCopy}
+        />
       </article>
       <article className="api-docs-section">
         <h3>Limits and errors</h3>
@@ -253,7 +300,7 @@ export function ApiUsageGuide({
                 ["413", "The file or request body exceeds its size limit."],
                 ["415", "Unsupported file type or compressed request body."],
                 ["401", "The API key is missing, expired, or revoked."],
-                ["403", "An OAuth token lacks the required scope."],
+                ["403", "The key or OAuth token lacks the required scope."],
                 [
                   "404",
                   "The organization, document, folder, or section is unavailable to you.",

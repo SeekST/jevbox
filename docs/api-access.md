@@ -2,11 +2,11 @@
 
 Open **Settings → API keys** to create a personal key and view the API URL, copyable requests, parameters, and response documentation. MCP setup guides and connected apps are in **Settings → MCP**. All organization members can manage their own keys. The secret is returned only at creation; copy it before closing the dialog. Keys expire after at most one year and can be revoked immediately. Better Auth’s API Key plugin generates and hashes the secret, enforces expiry and shared rate limits, and handles revocation. Keys cannot act as browser sessions.
 
-A key authenticates as its creator. Each request supplies an organization ID, and the server checks the creator's current membership and SpiceDB permissions. A key can access multiple organizations that its creator currently belongs to. Administration never bypasses private document or ancestor permissions. New keys can read and search accessible content and upload Private documents. Keys created before upload support remain read-only; create a new key to enable uploads. Keys have no separately configurable access scopes in the UI.
+A key authenticates as its creator. Each request supplies an organization ID, and the server checks the creator's current membership and SpiceDB permissions. A key can access multiple organizations that its creator currently belongs to. Administration never bypasses private document or ancestor permissions. New keys can read and search accessible content, upload Private documents, and organize, rename, move, and delete resources their creator is permitted to change. Keys keep the permissions they were created with: keys created before upload support remain read-only, and keys created before library management cannot change existing resources. Create a new key to gain newer permissions. Keys have no separately configurable access scopes in the UI.
 
 ## REST API
 
-Send `Authorization: Bearer <key>` to `/api/v1`. Cookie sessions are not accepted by this API. Browser endpoints retain their existing session and origin requirements; API keys can upload documents through the endpoint below. They cannot change permissions, manage keys, or modify existing resources.
+Send `Authorization: Bearer <key>` to `/api/v1`. Cookie sessions are not accepted by this API. Browser endpoints retain their existing session and origin requirements and do not accept API keys. Keys can upload documents and manage library resources through the endpoints below. They cannot change sharing or access, manage keys, or change organization settings.
 
 `GET /api/v1/organizations` lists the caller's accessible organization IDs and names.
 
@@ -55,6 +55,27 @@ Any file extension is accepted, with a hard limit of 250 MB (250,000,000 bytes) 
 
 Missing, expired, or revoked credentials return 401. Insufficient OAuth scopes return 403. Inaccessible organizations, documents, folders, and sections return 404. Permission-service failures return 503. Oversized uploads return 413, compressed request bodies return 415, and admission/quota limits return 429 with Retry-After. Invalid request metadata returns 400; upload timeouts return 408. Authenticated browser, REST, and MCP requests share a 100,000-read and 100,000-write allowance per minute per user. API keys additionally allow 100,000 requests per minute per key. Search is limited to 10,000 requests per minute per user and credential, with no organization-wide cap. Invalid credentials use a separate IP limit; authenticated users do not share an IP request bucket. Search can consume provider credits. Limits are configurable through [deployment settings](deployment.md#request-and-upload-limits).
 
+### Library management
+
+`GET /api/v1/resources?organizationId=<organization UUID>` lists folders and documents you can read, newest first. Optional `parentId` lists only a folder's direct children, and optional `kind` is `document` or `folder`. Each item has `id`, `kind`, `name`, `description`, `parentId`, `access`, `mime`, `size`, `status`, `error`, `pages`, `created`, `canWrite`, `canShare`, and `url`. Parsed text is not included; use the document fetch above. Requires `documents:read`.
+
+The following require `documents:manage` and take `organizationId` in the query string:
+
+| Request                           | Body                                      | Permission                                                |
+| --------------------------------- | ----------------------------------------- | --------------------------------------------------------- |
+| `POST /api/v1/folders`            | `{ "name", "description"?, "parentId"? }` | Write access to `parentId`                                |
+| `PATCH /api/v1/resources/:id`     | `{ "name", "description"? }`              | Write access                                              |
+| `POST /api/v1/resources/:id/move` | `{ "parentId": "<folder UUID>" \| null }` | Ownership of the item and write access to the destination |
+| `DELETE /api/v1/resources/:id`    | None                                      | Ownership of the item and everything inside it            |
+
+Folder creation returns HTTP 201 with `id` and `url`; new folders are owned by the caller and start Private. Rename and move return `{ "ok": true }`; omitting `description` keeps the current one, and an empty string clears it. Moving a folder into itself or a descendant returns 400, and moving an item to the root makes inherited access Private. Delete returns `{ "ok": true, "count": <deleted resources> }`. Deleting a folder deletes everything inside it and cannot be undone; if any item inside belongs to someone else, nothing is deleted and the request returns 404. Names are limited to 160 characters without slashes or control characters.
+
+```sh
+curl --fail-with-body -X DELETE \
+  "$JEVBOX_ORIGIN/api/v1/resources/$DOCUMENT_ID?organizationId=$ORGANIZATION_ID" \
+  -H "Authorization: Bearer $JEVBOX_API_KEY"
+```
+
 ## MCP
 
 Connect an MCP client to `<APP_ORIGIN>/mcp` using Streamable HTTP. The official TypeScript SDK v2 serves MCP 2026-07-28 and older clients through its stateless compatibility handler. MCP 2025-11-25 clients use the standard initialize handshake; SDK v2 clients can opt into 2026-07-28 with `versionNegotiation: { mode: { pin: "2026-07-28" } }`. Both protocols use the same authentication, current document permissions, and scoped tools:
@@ -69,8 +90,13 @@ Connect an MCP client to `<APP_ORIGIN>/mcp` using Streamable HTTP. The official 
 | `cancel_run`         | `organizationId`, `runId`                                                          |
 | `fetch`              | `organizationId`, `id`, optional `nodeId`, `offset`, `limit`                       |
 | `upload_document`    | `organizationId`, `filename`, `contentBase64`, optional `parentId`                 |
+| `list_resources`     | `organizationId`, optional `parentId`, `kind`                                      |
+| `create_folder`      | `organizationId`, `name`, optional `description`, `parentId`                       |
+| `rename_resource`    | `organizationId`, `id`, `name`, optional `description`                             |
+| `move_resource`      | `organizationId`, `id`, `parentId` (folder UUID or null)                           |
+| `delete_resource`    | `organizationId`, `id`                                                             |
 
-Clients supporting custom headers can use the same personal API key in the Authorization header. New API keys advertise the read tools and `upload_document`. Read-only keys and OAuth grants omit the upload tool. Native clients omit Origin; browser origins must match APP_ORIGIN or an explicit comma-separated `MCP_ALLOWED_ORIGINS` entry. This does not enable browser CORS access.
+Clients supporting custom headers can use the same personal API key in the Authorization header. New API keys advertise the read tools and `upload_document`. Keys and OAuth grants with `documents:manage` also advertise the four management tools; `delete_resource` is marked destructive. Read-only keys and OAuth grants omit the upload tool. Native clients omit Origin; browser origins must match APP_ORIGIN or an explicit comma-separated `MCP_ALLOWED_ORIGINS` entry. This does not enable browser CORS access.
 
 Integration tests cover tool discovery, search, fetch, permission checks, credential revocation, and OAuth with both protocol versions. A local check on October 2, 2026 verified Cursor 3.22.12 browser sign-in, consent, tool discovery, and a `list_organizations` call. VS Code desktop has not been verified locally.
 
@@ -94,11 +120,12 @@ Public desktop clients that omit `application_type` are registered as native onl
 
 OAuth clients request these scopes, which can only narrow the user's current permissions:
 
-| Scope             | Operations                                                             |
-| ----------------- | ---------------------------------------------------------------------- |
-| `search:read`     | Search accessible documents and return source passages                 |
-| `documents:read`  | Read document structure, sections, and passages                        |
-| `documents:write` | Upload a new Private document; does not edit, delete, or share content |
+| Scope              | Operations                                                                                        |
+| ------------------ | ------------------------------------------------------------------------------------------------- |
+| `search:read`      | Search accessible documents and return source passages                                            |
+| `documents:read`   | Read document structure, sections, and passages                                                   |
+| `documents:write`  | Upload a new Private document; does not edit, delete, or share content                            |
+| `documents:manage` | Create folders and rename, move, or delete resources the user may change; does not change sharing |
 
 `upload_document` accepts standard padded base64 of the actual file bytes, without a data URL prefix or whitespace. Decoded content uses the same 250 MB limit as browser and REST uploads. A client must have access to the file and the user's authorization to transmit it. The server does not accept a local path or fetch a caller-supplied URL. The multipart REST endpoint accepts raw file bytes with a credential authorized for `/api/v1`.
 

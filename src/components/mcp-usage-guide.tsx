@@ -7,8 +7,8 @@ export function McpUsageGuide({ onCopy }: { onCopy: (value: string) => void }) {
     <section className="settings-section api-docs" aria-label="MCP tools">
       <h2>Tools and uploads</h2>
       <p className="muted">
-        Search your library, read source passages, and upload Private documents
-        with your current permissions.
+        Search your library, read source passages, upload Private documents, and
+        organize your library with your current permissions.
       </p>
       <article className="api-docs-section">
         <h3>Available tools</h3>
@@ -29,6 +29,23 @@ export function McpUsageGuide({ onCopy }: { onCopy: (value: string) => void }) {
             {
               name: "upload_document",
               detail: "Add a new Private document with documents:write access.",
+            },
+            { name: "list_resources", detail: "List folders and documents." },
+            {
+              name: "create_folder",
+              detail: "Create a Private folder with documents:manage access.",
+            },
+            {
+              name: "rename_resource",
+              detail: "Rename a document or folder.",
+            },
+            {
+              name: "move_resource",
+              detail: "Move an item you own into another folder.",
+            },
+            {
+              name: "delete_resource",
+              detail: "Permanently delete an item you own and its contents.",
             },
           ]}
         />
@@ -99,6 +116,15 @@ export function McpUsageGuide({ onCopy }: { onCopy: (value: string) => void }) {
           Read-only grants do not expose <code>upload_document</code>. Reconnect
           and consent to upload access, or create a new API key. Existing grants
           and older keys keep their current permissions.
+        </p>
+      </article>
+      <article className="api-docs-section">
+        <h3>Library management access</h3>
+        <p>
+          Creating folders, renaming, moving, and deleting need{" "}
+          <code>documents:manage</code>. Older keys and grants do not include
+          it; reconnect and consent, or create a new API key. Clients should
+          confirm with you before calling <code>delete_resource</code>.
         </p>
       </article>
       <article className="api-docs-section">

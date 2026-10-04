@@ -1774,3 +1774,76 @@ test("upload revocation and storage failure roll back document, bytes, and queue
     "0",
   );
 });
+
+test("resource changes roll back when revalidation fails and deletes require share on every descendant", async () => {
+  const { createResourceOperations } = await import("../server/resources");
+  const resources = createResourceOperations(runtime.store);
+  const a = { userId, orgId, role: "member", token: "test" };
+  const revoked = {
+    revalidate: async () => {
+      throw new Error("Revoked");
+    },
+  };
+  const folderId = randomUUID();
+  const foreignChild = randomUUID();
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,kind,name,created) VALUES(?,?,?,'folder',?,?)",
+    folderId,
+    orgId,
+    userId,
+    "Rollback folder",
+    new Date().toISOString(),
+  );
+  const named = async (name: string) =>
+    (
+      await runtime.store.one<{ count: string }>(
+        "SELECT COUNT(*)::text AS count FROM resources WHERE name=?",
+        name,
+      )
+    )?.count;
+  await assert.rejects(
+    resources.createFolder(
+      a,
+      { name: "Revoked folder", description: "", parentId: null },
+      revoked,
+    ),
+    /Revoked/,
+  );
+  assert.equal(await named("Revoked folder"), "0");
+  await assert.rejects(
+    resources.rename(
+      a,
+      folderId,
+      { name: "Renamed", description: "" },
+      revoked,
+    ),
+    /Revoked/,
+  );
+  assert.equal(await named("Rollback folder"), "1");
+  await assert.rejects(resources.remove(a, [folderId], revoked), /Revoked/);
+  assert.equal(await named("Rollback folder"), "1");
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+    foreignChild,
+    orgId,
+    otherId,
+    folderId,
+    "Other member's document",
+    new Date().toISOString(),
+  );
+  await assert.rejects(resources.remove(a, [folderId]), /Resource not found/);
+  assert.equal(await named("Rollback folder"), "1");
+  assert.equal(await named("Other member's document"), "1");
+  await runtime.store.run("DELETE FROM resources WHERE id=?", foreignChild);
+  assert.equal(
+    await resources.remove(a, [folderId], { auditPrefix: "api." }),
+    1,
+  );
+  assert.equal(await named("Rollback folder"), "0");
+  assert.ok(
+    await runtime.store.one(
+      "SELECT 1 FROM audit WHERE resource_id=? AND action='api.resource.delete'",
+      folderId,
+    ),
+  );
+});

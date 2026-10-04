@@ -1847,3 +1847,56 @@ test("resource changes roll back when revalidation fails and deletes require sha
     ),
   );
 });
+
+test("new API keys include documents:manage while older keys keep their permissions", async () => {
+  const { createApiKeys } = await import("../server/api-keys");
+  const { createExternalAccess } = await import("../server/external-access");
+  const { createUploads } = await import("../server/uploads");
+  const keys = createApiKeys(runtime.auth);
+  const created = await key();
+  const older = await runtime.auth.api.createApiKey({
+    body: {
+      userId,
+      name: "Older",
+      permissions: { documents: ["read", "write"], search: ["read"] },
+      expiresIn: 86400,
+    },
+  });
+  try {
+    const current = await keys.authenticate(created.token);
+    assert.ok(current.scopes.includes("documents:manage"));
+    assert.deepEqual((await keys.authenticate(older.key)).scopes.sort(), [
+      "documents:read",
+      "documents:write",
+      "search:read",
+    ]);
+    const access = createExternalAccess(
+      runtime.store,
+      runtime.auth,
+      runtime.providers,
+      origin,
+      async () => {
+        throw new Error("Token validation is not used for keys");
+      },
+      false,
+      createUploads(runtime.store),
+    );
+    const delegated = await access.delegatedPrincipal(
+      JSON.stringify({ principal: current }),
+    );
+    assert.ok(delegated.scopes.includes("documents:manage"));
+    const metadata = await (
+      await fetch(base + "/.well-known/oauth-protected-resource/api/v1")
+    ).json();
+    assert.ok(metadata.scopes_supported.includes("documents:manage"));
+  } finally {
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    await session("/auth/api-key/update", "POST", {
+      keyId: older.id,
+      enabled: false,
+    });
+  }
+});

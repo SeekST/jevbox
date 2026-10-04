@@ -248,7 +248,7 @@ export function createExternalAccess(
           ? JSON.parse(key.permissions)
           : key.permissions;
       scopes = ["documents", "search"].flatMap((resource) =>
-        ["read", "write"]
+        ["read", "write", "manage"]
           .filter((operation) => permissions?.[resource]?.includes(operation))
           .map((operation) => `${resource}:${operation}`),
       );

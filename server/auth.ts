@@ -221,7 +221,7 @@ export function createAuthentication(
         },
         permissions: {
           defaultPermissions: {
-            documents: ["read", "write"],
+            documents: ["read", "write", "manage"],
             search: ["read"],
           },
         },

@@ -1900,3 +1900,99 @@ test("new API keys include documents:manage while older keys keep their permissi
     });
   }
 });
+
+test("REST lists readable resources with folder and kind filters", async () => {
+  const created = await key();
+  const folderId = randomUUID();
+  const nestedId = randomUUID();
+  const createdAt = new Date().toISOString();
+  let searchOnly: { id: string; key: string } | undefined;
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,kind,name,created) VALUES(?,?,?,'folder',?,?)",
+    folderId,
+    orgId,
+    userId,
+    "Listing folder",
+    createdAt,
+  );
+  await runtime.store.run(
+    "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+    nestedId,
+    orgId,
+    userId,
+    folderId,
+    "Nested",
+    createdAt,
+  );
+  try {
+    const list = (query = "", token = created.token) =>
+      request(`/api/v1/resources?organizationId=${orgId}${query}`, token);
+    const response = await list();
+    assert.equal(response.status, 200, await response.clone().text());
+    const all = (await response.json()).resources;
+    const ids = all.map((r: any) => r.id);
+    for (const visible of [ownId, sharedId, emptyFolderId, folderId, nestedId])
+      assert.ok(ids.includes(visible), visible);
+    assert.ok(!ids.includes(privateId));
+    assert.ok(!ids.includes(foreignId));
+    const shared = all.find((r: any) => r.id === sharedId);
+    assert.equal(shared.canWrite, false);
+    assert.equal(shared.canShare, false);
+    assert.equal("parsed" in shared, false);
+    const folder = all.find((r: any) => r.id === folderId);
+    assert.equal(folder.kind, "folder");
+    assert.equal(folder.mime, "");
+    assert.equal(folder.size, 0);
+    assert.equal(folder.pages, 0);
+    assert.equal(folder.url, `${origin}/library/folders/${folderId}`);
+    const folders = (await (await list("&kind=folder")).json()).resources;
+    assert.ok(folders.length > 0);
+    assert.ok(folders.every((r: any) => r.kind === "folder"));
+    const children = (await (await list(`&parentId=${folderId}`)).json())
+      .resources;
+    assert.deepEqual(
+      children.map((r: any) => r.id),
+      [nestedId],
+    );
+    assert.equal(children[0].parentId, folderId);
+    assert.equal(children[0].canWrite, true);
+    assert.equal(children[0].canShare, true);
+    assert.equal(children[0].url, `${origin}/library/documents/${nestedId}`);
+    assert.equal((await list(`&parentId=${ownId}`)).status, 404);
+    assert.equal((await list(`&parentId=${privateId}`)).status, 404);
+    assert.equal((await list(`&parentId=${foreignId}`)).status, 404);
+    assert.equal((await list("&kind=other")).status, 400);
+    assert.equal(
+      (
+        await request(
+          `/api/v1/resources?organizationId=${foreignOrgId}`,
+          created.token,
+        )
+      ).status,
+      404,
+    );
+    searchOnly = await runtime.auth.api.createApiKey({
+      body: {
+        userId,
+        name: "Search only",
+        permissions: { search: ["read"] },
+        expiresIn: 86400,
+      },
+    });
+    assert.equal((await list("", searchOnly!.key)).status, 403);
+  } finally {
+    await runtime.store.run("DELETE FROM resources WHERE id=ANY(?::text[])", [
+      nestedId,
+      folderId,
+    ]);
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    if (searchOnly)
+      await session("/auth/api-key/update", "POST", {
+        keyId: searchOnly.id,
+        enabled: false,
+      });
+  }
+});

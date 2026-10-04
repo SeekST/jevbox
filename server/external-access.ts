@@ -84,7 +84,7 @@ export const renameResourceInput = z
     organizationId,
     id: z.string().uuid(),
     name: resourceName,
-    description: resourceDescription,
+    description: z.string().max(1000).optional(),
   })
   .strict();
 export const moveResourceInput = z

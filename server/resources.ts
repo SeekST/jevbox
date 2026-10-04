@@ -92,15 +92,15 @@ export function createResourceOperations(store: Store) {
   function rename(
     a: Actor,
     id: string,
-    input: { name: string; description: string },
+    input: { name: string; description?: string },
     options: ResourceChange = {},
   ) {
     return change(options, async (prefix) => {
       const r = await requireResource(store, a, id, "write");
       await store.run(
-        "UPDATE resources SET name=?,description=? WHERE id=?",
+        "UPDATE resources SET name=?,description=COALESCE(?,description) WHERE id=?",
         input.name,
-        input.description,
+        input.description ?? null,
         r.id,
       );
       await audit(a, `${prefix}resource.update`, r.id);

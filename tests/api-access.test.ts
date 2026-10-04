@@ -2055,6 +2055,12 @@ test("REST manages folders and documents with documents:manage and web permissio
     assert.equal(renamed.status, 200, await renamed.clone().text());
     assert.equal((await row(folderId)).name, "Renamed");
     assert.equal((await row(folderId)).description, "Notes");
+    const nameOnly = await call(`/resources/${folderId}`, "PATCH", {
+      name: "Renamed again",
+    });
+    assert.equal(nameOnly.status, 200, await nameOnly.clone().text());
+    assert.equal((await row(folderId)).name, "Renamed again");
+    assert.equal((await row(folderId)).description, "Notes");
     assert.equal(
       (await call(`/resources/${sharedId}`, "PATCH", { name: "Nope" })).status,
       404,
@@ -2134,7 +2140,12 @@ test("REST manages folders and documents with documents:manage and web permissio
           folderId,
         )
       ).map(({ action }) => action),
-      ["api.folder.create", "api.resource.delete", "api.resource.update"],
+      [
+        "api.folder.create",
+        "api.resource.delete",
+        "api.resource.update",
+        "api.resource.update",
+      ],
     );
     const uploaded = await uploadRequest(
       created.token,

@@ -28,7 +28,12 @@ import {
 } from "./db";
 import { flatten, withLayoutSections, type ParsedDocument } from "./indexing";
 import type { createProviders } from "./providers";
-import { createResourceOperations } from "./resources";
+import {
+  createResourceOperations,
+  resourceDescription,
+  resourceName,
+  type ResourceChange,
+} from "./resources";
 import { uploadInput, decodeUpload, type createUploads } from "./uploads";
 import { searchRateLimits } from "./rate-limits";
 
@@ -65,6 +70,32 @@ export const listResourcesInput = z
     parentId: z.string().uuid().optional(),
     kind: z.enum(["document", "folder"]).optional(),
   })
+  .strict();
+export const createFolderInput = z
+  .object({
+    organizationId,
+    name: resourceName,
+    description: resourceDescription,
+    parentId: z.string().uuid().nullable().default(null),
+  })
+  .strict();
+export const renameResourceInput = z
+  .object({
+    organizationId,
+    id: z.string().uuid(),
+    name: resourceName,
+    description: resourceDescription,
+  })
+  .strict();
+export const moveResourceInput = z
+  .object({
+    organizationId,
+    id: z.string().uuid(),
+    parentId: z.string().uuid().nullable(),
+  })
+  .strict();
+export const deleteResourceInput = z
+  .object({ organizationId, id: z.string().uuid() })
   .strict();
 export const fetchInput = z
   .object({
@@ -520,6 +551,77 @@ export function createExternalAccess(
       ),
     };
   }
+  async function manage<T>(
+    principal: Principal,
+    orgId: string,
+    revalidate: () => Promise<Principal>,
+    work: (a: Actor, options: ResourceChange) => Promise<T>,
+  ) {
+    const a = await actor(principal, orgId);
+    return work(a, {
+      auditPrefix: "api.",
+      revalidate: async () => {
+        const current = await revalidate();
+        requireScope(current, "documents:manage");
+        await actor(current, orgId);
+      },
+    });
+  }
+  async function createFolder(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const { organizationId: orgId, ...input } = createFolderInput.parse(body);
+    const { id } = await manage(principal, orgId, revalidate, (a, options) =>
+      resources.createFolder(a, input, options),
+    );
+    return { id, url: `${origin}${folderPath(id)}` };
+  }
+  async function renameResource(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const {
+      organizationId: orgId,
+      id,
+      ...input
+    } = renameResourceInput.parse(body);
+    await manage(principal, orgId, revalidate, (a, options) =>
+      resources.rename(a, id, input, options),
+    );
+    return { ok: true };
+  }
+  async function moveResource(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const input = moveResourceInput.parse(body);
+    await manage(principal, input.organizationId, revalidate, (a, options) =>
+      resources.move(a, input.id, input.parentId, options),
+    );
+    return { ok: true };
+  }
+  async function deleteResource(
+    principal: Principal,
+    body: unknown,
+    revalidate: () => Promise<Principal>,
+  ) {
+    requireScope(principal, "documents:manage");
+    const input = deleteResourceInput.parse(body);
+    const count = await manage(
+      principal,
+      input.organizationId,
+      revalidate,
+      (a, options) => resources.remove(a, [input.id], options),
+    );
+    return { ok: true, count };
+  }
   function outline(node: ParsedDocument["nodes"][number]): unknown {
     return {
       id: node.id,
@@ -646,6 +748,42 @@ export function createExternalAccess(
       }),
     ),
   );
+  const managed =
+    (
+      handler: (
+        principal: Principal,
+        body: unknown,
+        revalidate: () => Promise<Principal>,
+      ) => Promise<object>,
+      body: (req: Request) => object,
+      status = 200,
+    ) =>
+    async (req: Request, res: import("express").Response) =>
+      res
+        .status(status)
+        .json(
+          await handler(
+            await authenticate(req, "/api/v1"),
+            { ...body(req), organizationId: req.query.organizationId },
+            () => authenticate(req, "/api/v1"),
+          ),
+        );
+  router.post(
+    "/folders",
+    managed(createFolder, (req) => ({ ...req.body }), 201),
+  );
+  router.patch(
+    "/resources/:id",
+    managed(renameResource, (req) => ({ ...req.body, id: req.params.id })),
+  );
+  router.post(
+    "/resources/:id/move",
+    managed(moveResource, (req) => ({ ...req.body, id: req.params.id })),
+  );
+  router.delete(
+    "/resources/:id",
+    managed(deleteResource, (req) => ({ id: req.params.id })),
+  );
   router.use((_req, res) => res.status(404).json({ error: "Not found" }));
   router.use(
     (
@@ -674,6 +812,10 @@ export function createExternalAccess(
     delegatedActor,
     organizations,
     listResources,
+    createFolder,
+    renameResource,
+    moveResource,
+    deleteResource,
     search,
     read,
     upload,

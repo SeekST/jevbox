@@ -1996,3 +1996,194 @@ test("REST lists readable resources with folder and kind filters", async () => {
       });
   }
 });
+
+test("REST manages folders and documents with documents:manage and web permissions", async () => {
+  await runtime.store.run("DELETE FROM upload_usage");
+  const created = await key();
+  let older: { id: string; key: string } | undefined;
+  try {
+    const call = (
+      path: string,
+      method: string,
+      body?: unknown,
+      token = created.token,
+    ) =>
+      request(
+        `/api/v1${path}${path.includes("?") ? "&" : "?"}organizationId=${orgId}`,
+        token,
+        method,
+        body,
+      );
+    const row = (id: string) =>
+      runtime.store.one<any>("SELECT * FROM resources WHERE id=?", id);
+    const folder = await call("/folders", "POST", { name: "Managed" });
+    assert.equal(folder.status, 201, await folder.clone().text());
+    const { id: folderId, url } = await folder.json();
+    assert.equal(url, `${origin}/library/folders/${folderId}`);
+    assert.equal((await row(folderId)).owner_id, userId);
+    assert.equal((await row(folderId)).access, "restricted");
+    const child = await call("/folders", "POST", {
+      name: "Child",
+      parentId: folderId,
+    });
+    assert.equal(child.status, 201, await child.clone().text());
+    const { id: childId } = await child.json();
+    for (const name of ["a/b", "tab\there", "x".repeat(161), " "])
+      assert.equal(
+        (await call("/folders", "POST", { name })).status,
+        400,
+        name,
+      );
+    assert.equal(
+      (
+        await call("/folders", "POST", {
+          name: "Under a document",
+          parentId: ownId,
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await call("/folders", "POST", { name: "Hidden", parentId: privateId }))
+        .status,
+      404,
+    );
+    const renamed = await call(`/resources/${folderId}`, "PATCH", {
+      name: "Renamed",
+      description: "Notes",
+    });
+    assert.equal(renamed.status, 200, await renamed.clone().text());
+    assert.equal((await row(folderId)).name, "Renamed");
+    assert.equal((await row(folderId)).description, "Notes");
+    assert.equal(
+      (await call(`/resources/${sharedId}`, "PATCH", { name: "Nope" })).status,
+      404,
+    );
+    assert.equal(
+      (await call(`/resources/${folderId}/move`, "POST", { parentId: childId }))
+        .status,
+      400,
+    );
+    assert.equal(
+      (
+        await call(`/resources/${folderId}/move`, "POST", {
+          parentId: folderId,
+        })
+      ).status,
+      400,
+    );
+    assert.equal(
+      (await call(`/resources/${childId}/move`, "POST", { parentId: ownId }))
+        .status,
+      400,
+    );
+    const inheritingId = randomUUID();
+    await runtime.store.run(
+      "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+      inheritingId,
+      orgId,
+      userId,
+      childId,
+      "Inheriting",
+      new Date().toISOString(),
+    );
+    const toRoot = await call(`/resources/${inheritingId}/move`, "POST", {
+      parentId: null,
+    });
+    assert.equal(toRoot.status, 200, await toRoot.clone().text());
+    assert.equal((await row(inheritingId)).parent_id, null);
+    assert.equal((await row(inheritingId)).access, "restricted");
+    assert.equal(
+      (
+        await call(`/resources/${inheritingId}/move`, "POST", {
+          parentId: childId,
+        })
+      ).status,
+      200,
+    );
+    assert.equal((await row(inheritingId)).parent_id, childId);
+    assert.equal(
+      (await call(`/resources/${sharedId}/move`, "POST", { parentId: null }))
+        .status,
+      404,
+    );
+    const othersDocument = randomUUID();
+    await runtime.store.run(
+      "INSERT INTO resources(id,org_id,owner_id,parent_id,kind,name,access,created) VALUES(?,?,?,?,'document',?,'inherit',?)",
+      othersDocument,
+      orgId,
+      otherId,
+      folderId,
+      "Owned by another member",
+      new Date().toISOString(),
+    );
+    assert.equal((await call(`/resources/${folderId}`, "DELETE")).status, 404);
+    assert.ok(await row(folderId));
+    assert.ok(await row(childId));
+    await runtime.store.run("DELETE FROM resources WHERE id=?", othersDocument);
+    const removed = await call(`/resources/${folderId}`, "DELETE");
+    assert.equal(removed.status, 200, await removed.clone().text());
+    assert.deepEqual(await removed.json(), { ok: true, count: 3 });
+    for (const gone of [folderId, childId, inheritingId])
+      assert.equal(await row(gone), undefined);
+    assert.equal((await call(`/resources/${folderId}`, "DELETE")).status, 404);
+    assert.deepEqual(
+      (
+        await runtime.store.all<{ action: string }>(
+          "SELECT action FROM audit WHERE resource_id=? ORDER BY action",
+          folderId,
+        )
+      ).map(({ action }) => action),
+      ["api.folder.create", "api.resource.delete", "api.resource.update"],
+    );
+    const uploaded = await uploadRequest(
+      created.token,
+      new Blob(["Queued text"], { type: "application/octet-stream" }),
+    );
+    assert.equal(uploaded.status, 201, await uploaded.clone().text());
+    const { id: queuedId } = await uploaded.json();
+    assert.equal((await call(`/resources/${queuedId}`, "DELETE")).status, 200);
+    assert.equal(await row(queuedId), undefined);
+    assert.equal((await call(`/resources/${foreignId}`, "DELETE")).status, 404);
+    assert.equal(
+      (
+        await request(
+          `/api/v1/resources/${foreignId}?organizationId=${foreignOrgId}`,
+          created.token,
+          "DELETE",
+        )
+      ).status,
+      404,
+    );
+    older = await runtime.auth.api.createApiKey({
+      body: {
+        userId,
+        name: "Before manage",
+        permissions: { documents: ["read", "write"], search: ["read"] },
+        expiresIn: 86400,
+      },
+    });
+    for (const [path, method, body] of [
+      ["/folders", "POST", { name: "Denied" }],
+      [`/resources/${ownId}`, "PATCH", { name: "Denied" }],
+      [`/resources/${ownId}/move`, "POST", { parentId: null }],
+      [`/resources/${ownId}`, "DELETE", undefined],
+    ] as const)
+      assert.equal(
+        (await call(path, method, body, older.key)).status,
+        403,
+        `${method} ${path}`,
+      );
+    assert.ok(await row(ownId));
+  } finally {
+    await session("/auth/api-key/update", "POST", {
+      keyId: created.key.id,
+      enabled: false,
+    });
+    if (older)
+      await session("/auth/api-key/update", "POST", {
+        keyId: older.id,
+        enabled: false,
+      });
+  }
+});
